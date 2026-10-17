@@ -4,9 +4,12 @@ A log-structured merge-tree (LSM) key-value store in Java, built from scratch,
 with an HTTP API and a live web UI that shows writes moving through the WAL, the
 memtable, the SSTables, and compaction.
 
+**Live demo: [lsm-kv.onrender.com](https://lsm-kv.onrender.com/)**. It runs on a
+free tier, so the first load after it has been idle takes about a minute, and
+data resets whenever it restarts.
+
 It's the storage design used by Cassandra (itself written in Java), RocksDB,
-LevelDB and ScyllaDB. The next milestone is replicating it across nodes with
-Raft; see the [roadmap](#roadmap).
+LevelDB and ScyllaDB.
 
 ## Architecture
 
@@ -133,11 +136,20 @@ curl localhost:8080/api/kv/user:1
 ## Deploy (backend + frontend together)
 
 The UI ships inside the jar, so one deployment serves both the API and the
-frontend from the same origin, with no CORS setup. The database writes to disk,
-so the host must provide a **persistent volume**. On hosts without one (Vercel,
-or Render's free tier), all data is wiped on every restart.
+frontend from the same origin, with no CORS setup.
 
-### Fly.io (recommended)
+### Render (how the live demo runs)
+
+The demo is a Docker web service on Render's free tier: **New → Web Service**,
+pick this repo, Docker runtime, **Free** instance, and health check path
+`/healthz`. Render sets `PORT`, and every push to `main` redeploys. The free tier
+has no persistent disk and sleeps after 15 idle minutes, so data resets whenever
+the service restarts.
+
+### Fly.io (keeps data)
+
+To keep data across restarts, the host needs a **persistent volume**.
+[fly.toml](fly.toml) is set up for Fly.io:
 
 ```sh
 brew install flyctl
@@ -152,14 +164,14 @@ fly open                         # https://<app>.fly.dev
 [fly.toml](fly.toml) asks for a 512 MB VM, because the JVM needs more headroom
 than a 256 MB one gives. Fly sends SIGTERM on redeploy, and a shutdown hook
 closes the store cleanly. Keep exactly **one** machine: this is a single-node
-engine for now, and a volume can only attach to one machine.
+engine, and a volume can only attach to one machine.
 
-### Alternatives
+### Other hosts
 
 - **Railway:** connect the GitHub repo. It detects the Dockerfile. Add a volume
   mounted at `/data`.
-- **Render:** create a Web Service from the repo using Docker, and attach a
-  persistent disk at `/data`. Disks need a paid instance.
+- **Render with a disk:** attach a persistent disk at `/data`. Disks need a paid
+  instance.
 
 ### Hosting the frontend separately (optional)
 
@@ -170,24 +182,6 @@ If you want the UI on GitHub Pages or Vercel and the API on Fly:
 2. Run `fly secrets set CORS_ORIGIN=https://<you>.github.io`.
 
 ## Roadmap
-
-### Distributed: Raft replication
-
-1. ~~**Single-node LSM engine**~~ (done)
-2. **Leader election:** RequestVote RPCs, randomized election timeouts, terms,
-   and persisted `currentTerm` and `votedFor`.
-3. **Log replication:** AppendEntries, commit index, and applying committed
-   commands to the LSM store as the state machine.
-4. **Snapshots:** compact the Raft log by snapshotting the store's SSTables, and
-   catch up lagging followers with InstallSnapshot.
-5. **Client semantics:** redirect clients to the leader, linearizable reads with
-   ReadIndex, and safe retries through client request IDs.
-6. **Fault injection:** kill nodes, partition the network, and drop or delay
-   messages. Record operation histories and check them for linearizability.
-7. **Cluster UI:** show nodes, the leader, terms, commit indexes and replication
-   lag live.
-
-### Storage engine
 
 - Background flush through an immutable memtable, so writes don't stall
 - Background and leveled compaction, with write amplification measured
