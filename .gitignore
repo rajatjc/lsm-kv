@@ -1,4 +1,7 @@
 /data/
-/lsm-kv
-*.test
-*.out
+/build/
+/.gradle/
+/.kotlin/
+.idea/
+*.iml
+.DS_Store

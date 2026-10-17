@@ -27,4 +27,4 @@ primary_region = "yyz" # Toronto
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "256mb"
+  memory = "512mb" # the JVM needs more headroom than 256 MB

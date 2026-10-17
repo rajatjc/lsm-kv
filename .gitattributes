@@ -1,0 +1,4 @@
+# The Unix start script must use LF, and the Windows one CRLF.
+/gradlew  text eol=lf
+*.bat     text eol=crlf
+*.jar     binary
