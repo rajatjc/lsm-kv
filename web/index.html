@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Leave empty when the Go server serves this page. Set to the backend URL
+     (e.g. https://lsm-kv.fly.dev) when hosting the UI separately. -->
+<meta name="api-base" content="">
+<title>LSM-KV Explorer</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --surface: #ffffff; --text: #1b1b1f; --muted: #6b6b75;
+    --border: #e3e3e0; --accent: #2f6fde; --accent-text: #ffffff;
+    --mem: #e8a33d; --wal: #8f6bd8; --sst: #2f6fde; --ok: #1f8a5b; --err: #c8433a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141417; --surface: #1d1d22; --text: #ececf0; --muted: #9a9aa6;
+      --border: #2e2e36; --accent: #6b9cf0; --accent-text: #0e0e12;
+      --mem: #f0b45a; --wal: #a98be6; --sst: #6b9cf0; --ok: #4cc28a; --err: #ef6f66;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 15px; margin: 0 0 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  p.lede { color: var(--muted); margin: 0 0 24px; max-width: 640px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .stat .n { font: 600 22px var(--mono); }
+  .stat .l { color: var(--muted); font-size: 13px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  input { font: 14px var(--mono); padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+          background: var(--bg); color: var(--text); min-width: 0; flex: 1 1 160px; }
+  button { font: 500 14px system-ui, sans-serif; padding: 8px 14px; border-radius: 6px; cursor: pointer;
+           border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .label { font-size: 13px; color: var(--muted); margin: 14px 0 6px; display: flex; justify-content: space-between; }
+  .bar { height: 14px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+  .bar > div { height: 100%; transition: width .3s; }
+  .tables { display: flex; gap: 6px; align-items: flex-end; min-height: 64px; flex-wrap: wrap; }
+  .sst { background: var(--sst); color: var(--accent-text); border-radius: 4px; padding: 6px 8px;
+         font: 12px var(--mono); min-width: 56px; animation: pop .3s; }
+  .sst.empty { background: none; border: 1px dashed var(--border); color: var(--muted); }
+  @keyframes pop { from { transform: scale(.85); opacity: 0; } }
+  .result { font: 13px var(--mono); margin-top: 10px; min-height: 20px; word-break: break-all; }
+  .ok { color: var(--ok); } .err { color: var(--err); }
+  table { width: 100%; border-collapse: collapse; font: 13px var(--mono); }
+  th { padding: 10px 4px 6px; color: var(--muted); font-weight: 500; }
+  td { padding: 6px 4px; border-top: 1px solid var(--border); word-break: break-all; }
+  #log { font: 12px var(--mono); color: var(--muted); max-height: 180px; overflow: auto; margin: 0; padding: 0; list-style: none; }
+  #log li { padding: 2px 0; }
+  footer { color: var(--muted); font-size: 13px; margin-top: 24px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>LSM-KV Explorer</h1>
+  <p class="lede">A log-structured merge-tree key-value store written in Go. Writes go to a WAL and an
+    in-memory memtable, which flushes to immutable SSTables. Each SSTable has a sparse index and a Bloom filter,
+    and SSTables get compacted together. Write some keys and watch the structure change.</p>
+
+  <section class="card">
+    <h2>Write path</h2>
+    <div class="label"><span>WAL</span><span id="walLabel">–</span></div>
+    <div class="bar"><div id="walBar" style="background:var(--wal);width:0"></div></div>
+    <div class="label"><span>Memtable (flushes when full)</span><span id="memLabel">–</span></div>
+    <div class="bar"><div id="memBar" style="background:var(--mem);width:0"></div></div>
+    <div class="label"><span>SSTables, newest first</span><span id="sstLabel">–</span></div>
+    <div class="tables" id="tables"></div>
+  </section>
+
+  <section class="card grid">
+    <div class="stat"><div class="n" id="flushes">0</div><div class="l">flushes</div></div>
+    <div class="stat"><div class="n" id="compactions">0</div><div class="l">compactions</div></div>
+    <div class="stat"><div class="n" id="skips">0</div><div class="l">disk reads avoided by Bloom</div></div>
+    <div class="stat"><div class="n" id="lookups">0</div><div class="l">SSTable reads</div></div>
+    <div class="stat"><div class="n" id="ratio">–</div><div class="l">Bloom skip rate</div></div>
+  </section>
+
+  <section class="card">
+    <h2>Read &amp; write</h2>
+    <div class="row">
+      <input id="key" aria-label="Key" placeholder="key" value="user:1">
+      <input id="value" aria-label="Value" placeholder="value" value='{"name":"Ada"}'>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="primary" data-op="put">Put</button>
+      <button data-op="get">Get</button>
+      <button data-op="del">Delete</button>
+      <span style="flex:1"></span>
+      <button data-op="bulk">Load 1,000 random keys</button>
+      <button data-op="flush">Flush</button>
+      <button data-op="compact">Compact</button>
+    </div>
+    <div class="result" id="result"></div>
+  </section>
+
+  <section class="card">
+    <h2>Prefix scan</h2>
+    <div class="row">
+      <input id="prefix" aria-label="Key prefix" placeholder="prefix, e.g. user:" value="user:">
+      <button data-op="scan">Scan</button>
+    </div>
+    <table>
+      <thead><tr><th scope="col" style="text-align:left">Key</th><th scope="col" style="text-align:left">Value</th></tr></thead>
+      <tbody id="scan"></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Activity</h2>
+    <ul id="log"></ul>
+  </section>
+
+  <footer>Source: <a href="https://github.com/rajatjc/lsm-kv">github.com/rajatjc/lsm-kv</a></footer>
+</main>
+
+<script>
+const API = (document.querySelector('meta[name="api-base"]').content || "").replace(/\/$/, "");
+const $ = (id) => document.getElementById(id);
+const fmtBytes = (b) => b < 1024 ? `${b} B` : b < 1 << 20 ? `${(b / 1024).toFixed(1)} KB` : `${(b / (1 << 20)).toFixed(2)} MB`;
+
+function log(msg) {
+  const li = document.createElement("li");
+  li.textContent = `${new Date().toLocaleTimeString()}  ${msg}`;
+  $("log").prepend(li);
+  while ($("log").children.length > 50) $("log").lastChild.remove();
+}
+
+function show(msg, ok) {
+  $("result").textContent = msg;
+  $("result").className = "result " + (ok ? "ok" : "err");
+}
+
+async function call(method, path, body, quiet = false) {
+  const t0 = performance.now();
+  const res = await fetch(API + path, { method, body });
+  const ms = (performance.now() - t0).toFixed(1);
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!quiet) log(`${method} ${path} → ${res.status} (${ms} ms)`);
+  if (!res.ok) throw new Error(data?.error || res.statusText);
+  return data;
+}
+
+function render(s) {
+  const memPct = Math.min(100, (s.memtableBytes / s.memtableLimit) * 100);
+  $("memBar").style.width = memPct + "%";
+  $("memLabel").textContent = `${s.memtableEntries} keys · ${fmtBytes(s.memtableBytes)} / ${fmtBytes(s.memtableLimit)}`;
+  $("walBar").style.width = Math.min(100, (s.walBytes / (s.memtableLimit * 1.5)) * 100) + "%";
+  $("walLabel").textContent = fmtBytes(s.walBytes);
+  $("sstLabel").textContent = `${s.tables.length} / ${s.compactAt} before compaction`;
+
+  const max = Math.max(1, ...s.tables.map((t) => t.bytes));
+  $("tables").replaceChildren(...(s.tables.length ? s.tables.map((t) => {
+    const d = document.createElement("div");
+    d.className = "sst";
+    d.style.height = 28 + (t.bytes / max) * 36 + "px";
+    d.title = `${t.entries} entries, ${fmtBytes(t.bytes)}`;
+    d.textContent = `#${t.id} · ${t.entries}`;
+    return d;
+  }) : [Object.assign(document.createElement("div"), { className: "sst empty", textContent: "no SSTables yet" })]));
+
+  $("flushes").textContent = s.flushes;
+  $("compactions").textContent = s.compactions;
+  $("skips").textContent = s.bloomSkips;
+  $("lookups").textContent = s.tableLookups;
+  const total = s.bloomSkips + s.tableLookups;
+  $("ratio").textContent = total ? Math.round((s.bloomSkips / total) * 100) + "%" : "–";
+}
+
+async function refresh() {
+  try { render(await call("GET", "/api/stats", undefined, true)); } catch (e) { show("backend unreachable: " + e.message, false); }
+}
+
+const key = () => encodeURIComponent($("key").value.trim());
+
+const ops = {
+  async put() { await call("PUT", `/api/kv/${key()}`, $("value").value); show(`stored ${$("key").value}`, true); },
+  async get() {
+    try { const r = await call("GET", `/api/kv/${key()}`); show(`${r.key} = ${r.value}`, true); }
+    catch (e) { show(e.message, false); }
+  },
+  async del() { await call("DELETE", `/api/kv/${key()}`); show(`tombstone written for ${$("key").value}`, true); },
+  async bulk() { const r = await call("POST", "/api/bulk?n=1000"); show(`wrote ${r.written} keys in ${r.elapsedMs} ms`, true); },
+  async flush() { await call("POST", "/api/flush"); show("memtable flushed to a new SSTable", true); },
+  async compact() { await call("POST", "/api/compact"); show("all SSTables merged; tombstones dropped", true); },
+  async scan() {
+    const rows = await call("GET", `/api/scan?limit=50&prefix=${encodeURIComponent($("prefix").value)}`);
+    $("scan").replaceChildren(...rows.map((r) => {
+      const tr = document.createElement("tr");
+      for (const v of [r.key, r.value]) { const td = document.createElement("td"); td.textContent = v; tr.append(td); }
+      return tr;
+    }));
+    show(`${rows.length} keys (showing up to 50)`, true);
+  },
+};
+
+document.querySelectorAll("button[data-op]").forEach((b) => b.addEventListener("click", async () => {
+  b.disabled = true;
+  try { await ops[b.dataset.op](); } catch (e) { show(e.message, false); }
+  b.disabled = false;
+  refresh(); // Get updates the Bloom counters too
+}));
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+/data/
+/lsm-kv
+*.test
+*.out
