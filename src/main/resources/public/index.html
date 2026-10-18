@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- Leave empty when the Go server serves this page. Set to the backend URL
+<!-- Leave empty when the lsm-kv server serves this page. Set to the backend URL
      (e.g. https://lsm-kv.fly.dev) when hosting the UI separately. -->
 <meta name="api-base" content="">
 <title>LSM-KV Explorer</title>
@@ -56,6 +56,26 @@
   #log li { padding: 2px 0; }
   footer { color: var(--muted); font-size: 13px; margin-top: 24px; }
   a { color: var(--accent); }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+  .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none;
+                    color: var(--muted); padding: 8px 14px; }
+  .tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+  .banner { border-left: 3px solid var(--mem); padding: 10px 14px; margin-bottom: 16px; background: var(--surface);
+            border-radius: 6px; font-size: 14px; }
+  .banner.live { border-left-color: var(--ok); }
+  .banner.err { border-left-color: var(--err); }
+  .pods { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+  .pod { border: 1px solid var(--border); border-left: 4px solid var(--muted); border-radius: 8px; padding: 12px;
+         background: var(--bg); animation: pop .3s; transition: border-color .3s; }
+  .pod.green { border-left-color: var(--ok); }
+  .pod.yellow { border-left-color: var(--mem); }
+  .pod.red { border-left-color: var(--err); opacity: .75; }
+  .pod .name { font: 600 14px var(--mono); }
+  .pod .status { font: 13px var(--mono); margin: 4px 0; }
+  .pod .meta { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  .pod button { width: 100%; }
+  #events { font: 12px var(--mono); color: var(--muted); max-height: 220px; overflow: auto; margin: 0; padding: 0; list-style: none; }
+  #events li { padding: 2px 0; }
 </style>
 </head>
 <body>
@@ -65,6 +85,27 @@
     in-memory memtable, which flushes to immutable SSTables. Each SSTable has a sparse index and a Bloom filter,
     and SSTables get compacted together. Write some keys and watch the structure change.</p>
 
+  <div class="tabs" role="tablist">
+    <button role="tab" id="tab-explorer" aria-controls="explorer" aria-selected="true">Explorer</button>
+    <button role="tab" id="tab-cluster" aria-controls="cluster" aria-selected="false" hidden>Cluster</button>
+  </div>
+
+  <div id="cluster" role="tabpanel" aria-labelledby="tab-cluster" hidden>
+    <div class="banner" id="clusterBanner">Connecting…</div>
+    <section class="card">
+      <h2>Pods</h2>
+      <p class="lede" style="margin-bottom:14px">Each pod runs lsm-kv as part of a Kubernetes StatefulSet. Kill one and
+        watch Kubernetes replace it: the pod terminates, and a new pod with the same name is scheduled, starts, and
+        passes its readiness check. Its volume is reattached, so its data survives.</p>
+      <div class="pods" id="pods"></div>
+    </section>
+    <section class="card">
+      <h2>Events</h2>
+      <ul id="events"></ul>
+    </section>
+  </div>
+
+  <div id="explorer" role="tabpanel" aria-labelledby="tab-explorer">
   <section class="card">
     <h2>Write path</h2>
     <div class="label"><span>WAL</span><span id="walLabel">–</span></div>
@@ -117,6 +158,7 @@
     <h2>Activity</h2>
     <ul id="log"></ul>
   </section>
+  </div>
 
   <footer>Source: <a href="https://github.com/rajatjc/lsm-kv">github.com/rajatjc/lsm-kv</a></footer>
 </main>
@@ -211,6 +253,122 @@ document.querySelectorAll("button[data-op]").forEach((b) => b.addEventListener("
 
 refresh();
 setInterval(refresh, 3000);
+
+// ---- Cluster tab ----
+const README = "https://github.com/rajatjc/lsm-kv#run-the-cluster-view-on-a-real-cluster";
+let lastPods = null;
+let stream = null;
+
+function selectTab(name) {
+  for (const t of ["explorer", "cluster"]) {
+    $(t).hidden = t !== name;
+    $("tab-" + t).setAttribute("aria-selected", String(t === name));
+  }
+  if (name === "cluster") connectCluster();
+  history.replaceState(null, "", name === "cluster" ? "#cluster" : location.pathname);
+}
+
+function age(ms) {
+  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  return Math.floor(s / 86400) + "d";
+}
+
+function color(p) {
+  if (p.status === "Running" && p.ready) return "green";
+  if (["Terminating", "Failed", "Error", "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "OOMKilled"].includes(p.status)) return "red";
+  return "yellow";
+}
+
+function event(msg) {
+  const li = document.createElement("li");
+  li.textContent = `${new Date().toLocaleTimeString()}  ${msg}`;
+  $("events").prepend(li);
+  while ($("events").children.length > 100) $("events").lastChild.remove();
+}
+
+function describe(p) {
+  return p.status === "Running" && !p.ready ? "Running (not ready)" : p.status;
+}
+
+function diff(before, after) {
+  const old = new Map(before.map((p) => [p.name, p]));
+  const now = new Map(after.map((p) => [p.name, p]));
+  for (const p of after) {
+    const o = old.get(p.name);
+    if (!o) event(`${p.name} created → ${describe(p)}`);
+    else if (o.createdAt !== p.createdAt) event(`${p.name} replaced → ${describe(p)}`);
+    else if (describe(o) !== describe(p)) event(`${p.name} ${describe(o)} → ${describe(p)}`);
+    if (o && p.restarts > o.restarts) event(`${p.name} container restarted (${p.restarts} restarts)`);
+  }
+  for (const p of before) if (!now.has(p.name)) event(`${p.name} deleted`);
+}
+
+function renderPods(pods) {
+  $("pods").replaceChildren(...pods.map((p) => {
+    const card = document.createElement("div");
+    card.className = "pod " + color(p);
+    const name = Object.assign(document.createElement("div"), { className: "name", textContent: p.name });
+    const status = Object.assign(document.createElement("div"), { className: "status", textContent: describe(p) });
+    const meta = Object.assign(document.createElement("div"), { className: "meta" });
+    meta.textContent = `age ${age(p.createdAt)} · restarts ${p.restarts} · ${p.node || "not scheduled"}`;
+    meta.dataset.created = p.createdAt;
+    meta.dataset.rest = ` · restarts ${p.restarts} · ${p.node || "not scheduled"}`;
+    const kill = Object.assign(document.createElement("button"), { textContent: "Kill pod", disabled: !p.killable });
+    kill.addEventListener("click", async () => {
+      kill.disabled = true;
+      try {
+        const res = await fetch(`${API}/api/cluster/pods/${encodeURIComponent(p.name)}/kill`, { method: "POST" });
+        if (!res.ok) event(`could not kill ${p.name}: ${(await res.json()).error}`);
+        else event(`you killed ${p.name}`);
+      } catch (e) { event(`could not kill ${p.name}: ${e.message}`); }
+    });
+    card.append(name, status, meta, kill);
+    return card;
+  }));
+}
+
+function renderCluster(c) {
+  const banner = $("clusterBanner");
+  if (c.error) {
+    banner.className = "banner err";
+    banner.textContent = c.error;
+  } else if (c.mode === "demo") {
+    banner.className = "banner";
+    banner.innerHTML = "<strong>Demo mode:</strong> these pods are simulated, so you can see what the live view does " +
+      `without a cluster. To watch real pods, <a href="${README}">run it on a local Kubernetes cluster</a>.`;
+  } else {
+    banner.className = "banner live";
+    banner.textContent = `Live: pods in namespace "${c.namespace}", watched through the Kubernetes API.`;
+  }
+  if (lastPods) diff(lastPods, c.pods);
+  lastPods = c.pods;
+  renderPods(c.pods);
+}
+
+function connectCluster() {
+  if (stream) return;
+  stream = new EventSource(API + "/api/cluster/events"); // reconnects by itself if the connection drops
+  stream.onmessage = (e) => renderCluster(JSON.parse(e.data));
+  stream.onerror = () => { $("clusterBanner").className = "banner err"; $("clusterBanner").textContent = "Reconnecting…"; };
+}
+
+// Keep the pod ages ticking between updates.
+setInterval(() => {
+  for (const m of document.querySelectorAll(".pod .meta")) m.textContent = `age ${age(+m.dataset.created)}${m.dataset.rest}`;
+}, 1000);
+
+$("tab-explorer").addEventListener("click", () => selectTab("explorer"));
+$("tab-cluster").addEventListener("click", () => selectTab("cluster"));
+
+// Show the Cluster tab only when the server has a cluster view.
+fetch(API + "/api/cluster").then((res) => {
+  if (!res.ok) return;
+  $("tab-cluster").hidden = false;
+  if (location.hash === "#cluster") selectTab("cluster");
+}).catch(() => {});
 </script>
 </body>
 </html>

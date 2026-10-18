@@ -2,6 +2,11 @@ package io.github.rajatjc.lsmkv.server;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import io.github.rajatjc.lsmkv.cluster.Cluster;
+import io.github.rajatjc.lsmkv.cluster.KubernetesCluster;
+import io.github.rajatjc.lsmkv.cluster.PodFeed;
+import io.github.rajatjc.lsmkv.cluster.PodView;
+import io.github.rajatjc.lsmkv.cluster.SimulatedCluster;
 import io.github.rajatjc.lsmkv.storage.LsmStore;
 import io.github.rajatjc.lsmkv.storage.Options;
 import io.github.rajatjc.lsmkv.storage.Stats;
@@ -12,6 +17,8 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.file.Path;
+import java.security.GeneralSecurityException;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
@@ -19,6 +26,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
@@ -27,23 +37,30 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * one virtual thread per request, so it has no runtime dependencies.
  *
  * <p>Environment: PORT (8080), DATA_DIR (./data), SYNC_WRITES ("true" to fsync
- * every write), CORS_ORIGIN (when the UI is hosted elsewhere), MAX_DATA_MB (100).
+ * every write), CORS_ORIGIN (when the UI is hosted elsewhere), MAX_DATA_MB (100),
+ * CLUSTER_MODE (demo, kubernetes or off; defaults to kubernetes inside a cluster
+ * and demo elsewhere), POD_SELECTOR (app=lsm-kv).
  */
 public final class KvServer {
     private static final int MAX_KEY_BYTES = 256;
     private static final int MAX_VALUE_BYTES = 64 << 10;
     private static final int MAX_BULK = 5000;
     private static final String KV_PATH = "/api/kv/";
+    private static final Pattern KILL_PATH = Pattern.compile("/api/cluster/pods/([^/]+)/kill");
+    private static final long KILL_INTERVAL_MS = 2000;
 
     private final LsmStore store;
     private final long maxDataBytes;
     private final String corsOrigin;
+    private final Cluster cluster; // null when the cluster view is off
+    private final AtomicLong lastKill = new AtomicLong();
     private final byte[] indexHtml;
 
-    KvServer(LsmStore store, long maxDataBytes, String corsOrigin) throws IOException {
+    KvServer(LsmStore store, long maxDataBytes, String corsOrigin, Cluster cluster) throws IOException {
         this.store = store;
         this.maxDataBytes = maxDataBytes;
         this.corsOrigin = corsOrigin;
+        this.cluster = cluster;
         try (InputStream in = KvServer.class.getResourceAsStream("/public/index.html")) {
             if (in == null) {
                 throw new IOException("missing /public/index.html on the classpath");
@@ -52,13 +69,14 @@ public final class KvServer {
         }
     }
 
-    public static void main(String[] args) throws IOException {
+    public static void main(String[] args) throws IOException, GeneralSecurityException {
         LsmStore store = LsmStore.open(new Options(
                 Path.of(env("DATA_DIR", "./data")),
                 64 << 10, // small, so flushes and compactions are visible in the demo
                 4,
                 env("SYNC_WRITES", "false").equals("true")));
-        KvServer app = new KvServer(store, Long.parseLong(env("MAX_DATA_MB", "100")) << 20, env("CORS_ORIGIN", ""));
+        KvServer app = new KvServer(store, Long.parseLong(env("MAX_DATA_MB", "100")) << 20, env("CORS_ORIGIN", ""),
+                cluster(env("CLUSTER_MODE", System.getenv("KUBERNETES_SERVICE_HOST") != null ? "kubernetes" : "demo")));
 
         HttpServer http = HttpServer.create(new InetSocketAddress(Integer.parseInt(env("PORT", "8080"))), 0);
         http.createContext("/", app::handle);
@@ -74,6 +92,16 @@ public final class KvServer {
         }));
         http.start();
         System.out.println("listening on :" + http.getAddress().getPort());
+    }
+
+    private static Cluster cluster(String mode) throws IOException, GeneralSecurityException {
+        System.out.println("cluster view: " + mode);
+        return switch (mode) {
+            case "demo" -> new SimulatedCluster(3, Duration.ofSeconds(1));
+            case "kubernetes" -> KubernetesCluster.inCluster(env("POD_SELECTOR", "app=lsm-kv"));
+            case "off" -> null;
+            default -> throw new IllegalArgumentException("CLUSTER_MODE must be demo, kubernetes or off, not " + mode);
+        };
     }
 
     private static String env(String key, String fallback) {
@@ -106,6 +134,10 @@ public final class KvServer {
     private void route(HttpExchange ex, String method, String path) throws IOException {
         if (path.startsWith(KV_PATH)) {
             kv(ex, method, path.substring(KV_PATH.length()));
+            return;
+        }
+        if (path.startsWith("/api/cluster")) {
+            cluster(ex, method, path);
             return;
         }
         switch (method + " " + path) {
@@ -193,6 +225,83 @@ public final class KvServer {
             store.put(("user:" + h).getBytes(UTF_8), ("{\"id\":\"" + h + "\"}").getBytes(UTF_8));
         }
         json(ex, 200, Json.object("written", n, "elapsedMs", (System.nanoTime() - start) / 1_000_000));
+    }
+
+    private void cluster(HttpExchange ex, String method, String path) throws IOException {
+        if (cluster == null) {
+            error(ex, 404, "the cluster view is off");
+            return;
+        }
+        Matcher kill = KILL_PATH.matcher(path);
+        if (method.equals("GET") && path.equals("/api/cluster")) {
+            json(ex, 200, clusterJson(cluster.feed().current()));
+        } else if (method.equals("GET") && path.equals("/api/cluster/events")) {
+            streamCluster(ex);
+        } else if (method.equals("POST") && kill.matches()) {
+            long now = System.currentTimeMillis();
+            long last = lastKill.get();
+            if (now - last < KILL_INTERVAL_MS || !lastKill.compareAndSet(last, now)) {
+                error(ex, 429, "one kill every 2 seconds, please");
+                return;
+            }
+            try {
+                cluster.kill(kill.group(1));
+            } catch (IllegalStateException e) {
+                error(ex, 409, e.getMessage());
+                return;
+            }
+            send(ex, 202, null, null);
+        } else {
+            error(ex, 404, "not found");
+        }
+    }
+
+    /** Server-Sent Events: the pod list now, then again after every change. */
+    private void streamCluster(HttpExchange ex) throws IOException {
+        var headers = ex.getResponseHeaders();
+        headers.set("Content-Type", "text/event-stream");
+        headers.set("Cache-Control", "no-cache");
+        headers.set("X-Accel-Buffering", "no"); // tell proxies not to buffer the stream
+        ex.sendResponseHeaders(200, 0);
+        OutputStream out = ex.getResponseBody();
+        PodFeed.Snapshot snapshot = cluster.feed().current();
+        try {
+            while (true) {
+                out.write(("data: " + clusterJson(snapshot) + "\n\n").getBytes(UTF_8));
+                out.flush();
+                PodFeed.Snapshot next = cluster.feed().awaitNewer(snapshot.version(), Duration.ofSeconds(15));
+                while (next.version() == snapshot.version()) {
+                    out.write(": keep-alive\n\n".getBytes(UTF_8)); // also detects closed tabs
+                    out.flush();
+                    next = cluster.feed().awaitNewer(snapshot.version(), Duration.ofSeconds(15));
+                }
+                snapshot = next;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (IOException gone) {
+            // the browser closed the stream
+        }
+    }
+
+    private String clusterJson(PodFeed.Snapshot snapshot) {
+        List<String> pods = snapshot.pods().stream().map(KvServer::podJson).toList();
+        return Json.object(
+                "mode", cluster.mode(),
+                "namespace", cluster.namespace(),
+                "pods", new Json.Raw(Json.array(pods)),
+                "error", snapshot.error() == null ? new Json.Raw("null") : snapshot.error());
+    }
+
+    private static String podJson(PodView p) {
+        return Json.object(
+                "name", p.name(),
+                "status", p.status(),
+                "ready", p.ready(),
+                "restarts", p.restarts(),
+                "createdAt", p.createdAt(),
+                "node", p.node() == null ? new Json.Raw("null") : p.node(),
+                "killable", p.killable());
     }
 
     private boolean full() {

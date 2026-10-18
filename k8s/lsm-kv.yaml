@@ -1,0 +1,150 @@
+# lsm-kv on Kubernetes: three store pods (a StatefulSet, each with its own volume)
+# and a dashboard that serves the website and watches them.
+# Build the image as lsm-kv:dev first; see "Run the Cluster view on a real cluster" in the README.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lsm-kv
+---
+# The pods the Cluster tab shows and lets you kill.
+apiVersion: v1
+kind: Service
+metadata:
+  name: lsm-kv
+  namespace: lsm-kv
+spec:
+  clusterIP: None # headless: gives each StatefulSet pod a stable DNS name
+  selector:
+    app: lsm-kv
+  ports:
+    - port: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: lsm-kv
+  namespace: lsm-kv
+spec:
+  serviceName: lsm-kv
+  replicas: 3
+  selector:
+    matchLabels:
+      app: lsm-kv
+  template:
+    metadata:
+      labels:
+        app: lsm-kv
+    spec:
+      containers:
+        - name: lsm-kv
+          image: lsm-kv:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: CLUSTER_MODE
+              value: "off" # store pods don't watch the cluster themselves
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 2
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 50m
+            limits:
+              memory: 384Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Mi
+---
+# The dashboard may only see and delete pods in this namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lsm-kv-dashboard
+  namespace: lsm-kv
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-watcher
+  namespace: lsm-kv
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lsm-kv-dashboard
+  namespace: lsm-kv
+subjects:
+  - kind: ServiceAccount
+    name: lsm-kv-dashboard
+    namespace: lsm-kv
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pod-watcher
+---
+# Serves the website. It's a separate Deployment, so killing a store pod never
+# drops your connection to the page.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lsm-kv-dashboard
+  namespace: lsm-kv
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lsm-kv-dashboard
+  template:
+    metadata:
+      labels:
+        app: lsm-kv-dashboard
+    spec:
+      serviceAccountName: lsm-kv-dashboard
+      containers:
+        - name: dashboard
+          image: lsm-kv:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: CLUSTER_MODE
+              value: kubernetes
+            - name: POD_SELECTOR
+              value: app=lsm-kv
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 50m
+            limits:
+              memory: 384Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lsm-kv-dashboard
+  namespace: lsm-kv
+spec:
+  selector:
+    app: lsm-kv-dashboard
+  ports:
+    - port: 8080
