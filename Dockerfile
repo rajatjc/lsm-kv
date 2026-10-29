@@ -1,4 +1,4 @@
-FROM eclipse-temurin:21-jdk AS build
+FROM eclipse-temurin:24-jdk AS build
 WORKDIR /src
 # Download Gradle in its own layer so code changes don't re-fetch it.
 COPY gradlew settings.gradle.kts build.gradle.kts ./
@@ -8,7 +8,7 @@ COPY src src
 RUN ./gradlew --no-daemon jar
 
 # Runs as root so it can write to platform-mounted volumes (Fly/Render mount them root-owned).
-FROM eclipse-temurin:21-jre
+FROM eclipse-temurin:24-jre
 COPY --from=build /src/build/libs/lsm-kv.jar /app/lsm-kv.jar
 ENV DATA_DIR=/data PORT=8080
 EXPOSE 8080
