@@ -19,6 +19,10 @@ updates:
     commit-message:
       prefix: chore
       include: scope
+    ignore:
+      # Stay on the Java 21 LTS. Move up by hand when you choose to.
+      - dependency-name: eclipse-temurin
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
