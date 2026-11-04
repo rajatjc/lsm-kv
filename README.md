@@ -13,6 +13,10 @@ lsm-kv pods running in Kubernetes. Kill one and watch Kubernetes replace it with
 its data intact. On the demo site those pods are simulated; to see real ones,
 [run it on a local cluster](#run-the-cluster-view-on-a-real-cluster).
 
+| Explorer: the write path, Bloom filter stats and activity log | Cluster: a pod was killed and is being replaced |
+| --- | --- |
+| ![The Explorer tab after loading keys, flushing and compacting: one SSTable, four flushes, one compaction and an 83% Bloom skip rate](docs/screenshots/explorer.png) | ![The Cluster tab in demo mode, with two running pods and an event log showing lsm-kv-0 being killed and deleted](docs/screenshots/cluster-kill.png) |
+
 It's the storage design used by Cassandra (itself written in Java), RocksDB,
 LevelDB and ScyllaDB.
 
